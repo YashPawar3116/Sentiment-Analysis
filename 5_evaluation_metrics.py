@@ -19,6 +19,24 @@
     data/results/per_emotion_f1.csv
     data/results/confusion_matrices/  (*.npy)
     data/results/best_model.json      (winner declaration)
+
+  FIXES vs original:
+  ─────────────────────────────────────────────────────────
+  [BUG FIX]  BiLSTM load path updated to bilstm_model.keras
+             (must match the .keras extension used in Part 4)
+
+  [BUG FIX]  DistilBERT eval now checks for a sentinel file
+             (distilbert_trained.flag) that Part 4 only writes
+             when fine-tuning actually completed. Previously it
+             found the pre-downloaded weights folder and tried
+             to run CPU inference on 40k samples — causing the
+             1-hour hang. If the flag is absent, eval is skipped.
+
+  [ACCURACY] Logistic Regression used saga+multinomial which
+             diverges on sparse TF-IDF. Part 4 now uses
+             lbfgs+ovr. The feature_key stored in the pkl will
+             still route correctly here — no change needed in
+             this file for that fix.
 ============================================================
 """
 
@@ -45,6 +63,9 @@ RESULTS_DIR  = BASE_DIR / "data" / "results"
 CM_DIR       = RESULTS_DIR / "confusion_matrices"
 for d in [RESULTS_DIR, CM_DIR]:
     d.mkdir(parents=True, exist_ok=True)
+
+# Sentinel file written by Part 4 only when DistilBERT fine-tuning completed
+DISTILBERT_FLAG = TRAINED_DIR / "distilbert_trained.flag"
 
 EMOTION_GROUPS = {
     "positive":  ["admiration", "amusement", "approval", "caring", "curiosity",
@@ -127,7 +148,6 @@ def safe_auc(model, X, y_true, classes):
 # ═══════════════════════════════════════════════════════════
 
 def per_emotion_metrics(y_true, y_pred, id2emotion, classes):
-    """Return dict of {emotion: {precision, recall, f1, support}}"""
     report = classification_report(y_true, y_pred, output_dict=True, zero_division=0)
     rows = []
     for k, v in report.items():
@@ -146,7 +166,7 @@ def per_emotion_metrics(y_true, y_pred, id2emotion, classes):
 
 
 # ═══════════════════════════════════════════════════════════
-#  EVALUATE ONE MODEL
+#  EVALUATE ONE CLASSICAL MODEL
 # ═══════════════════════════════════════════════════════════
 
 def evaluate_model(name, bundle, feats, y_train, y_val, y_test, classes, id2emotion):
@@ -180,9 +200,7 @@ def evaluate_model(name, bundle, feats, y_train, y_val, y_test, classes, id2emot
 
         if split == "test":
             metrics["roc_auc"] = safe_auc(model, X, y_true, classes)
-            # Per-emotion report
             result["per_emotion"] = per_emotion_metrics(y_true, y_pred, id2emotion, classes)
-            # Confusion matrix
             cm = confusion_matrix(y_true, y_pred)
             safe = name.replace(" ", "_").replace("(","").replace(")","").replace("/","-")
             np.save(CM_DIR / f"{safe}_cm.npy", cm)
@@ -198,14 +216,23 @@ def evaluate_model(name, bundle, feats, y_train, y_val, y_test, classes, id2emot
 
 
 # ═══════════════════════════════════════════════════════════
-#  DEEP LEARNING EVALUATION
+#  BILSTM EVALUATION
+#  FIX: look for bilstm_model.keras (Keras 3 extension)
+#       also falls back to old bare-directory path in case
+#       user has a model from a previous run
 # ═══════════════════════════════════════════════════════════
 
 def evaluate_bilstm(y_train, y_val, y_test, classes, id2emotion):
-    model_path = TRAINED_DIR / "bilstm_model"
-    if not model_path.exists():
+    # Prefer new .keras path; fall back to old bare path for backwards compat
+    keras_path = TRAINED_DIR / "bilstm_model.keras"
+    old_path   = TRAINED_DIR / "bilstm_model"
+    model_path = keras_path if keras_path.exists() else (old_path if old_path.exists() else None)
+
+    if model_path is None:
+        print("\n  [SKIP] BiLSTM model not found — was it trained?")
         return None
-    print("\n  Evaluating BiLSTM...")
+
+    print(f"\n  Evaluating BiLSTM ({model_path.name})...")
     try:
         import tensorflow as tf
         model = tf.keras.models.load_model(str(model_path))
@@ -230,7 +257,8 @@ def evaluate_bilstm(y_train, y_val, y_test, classes, id2emotion):
             if split == "test":
                 y_bin = label_binarize(y_true, classes=classes)
                 try:
-                    metrics["roc_auc"] = round(float(roc_auc_score(y_bin, prob, multi_class="ovr", average="weighted")), 4)
+                    metrics["roc_auc"] = round(float(roc_auc_score(
+                        y_bin, prob, multi_class="ovr", average="weighted")), 4)
                 except:
                     metrics["roc_auc"] = None
                 results["per_emotion"] = per_emotion_metrics(y_true, y_pred, id2emotion, classes)
@@ -251,10 +279,30 @@ def evaluate_bilstm(y_train, y_val, y_test, classes, id2emotion):
         return None
 
 
+# ═══════════════════════════════════════════════════════════
+#  DISTILBERT EVALUATION
+#
+#  FIX: The pre-trained weights folder is always present after
+#  Part 3 tokenization (the tokenizer is downloaded then).
+#  The old code checked for that folder and then hung for
+#  1+ hour running CPU inference on all splits.
+#
+#  Now we check for a sentinel flag file that Part 4 writes
+#  ONLY after successful fine-tuning. If the flag is absent,
+#  we skip evaluation entirely with a clear message.
+# ═══════════════════════════════════════════════════════════
+
 def evaluate_distilbert(y_train, y_val, y_test, classes, id2emotion):
+    if not DISTILBERT_FLAG.exists():
+        print("\n  [SKIP] DistilBERT was not fine-tuned (no GPU or skipped).")
+        print(f"         To enable: train with GPU and ensure Part 4 writes {DISTILBERT_FLAG.name}")
+        return None
+
     model_path = TRAINED_DIR / "distilbert_model"
     if not model_path.exists():
+        print("\n  [SKIP] distilbert_model folder not found.")
         return None
+
     print("\n  Evaluating DistilBERT...")
     try:
         import torch
@@ -262,6 +310,7 @@ def evaluate_distilbert(y_train, y_val, y_test, classes, id2emotion):
         from torch.utils.data import DataLoader, TensorDataset
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"    Device: {device}")
         model  = DistilBertForSequenceClassification.from_pretrained(str(model_path)).to(device)
         model.eval()
         results = {"name": "DistilBERT (fine-tuned)", "feature": "bert_tokens"}
@@ -297,7 +346,8 @@ def evaluate_distilbert(y_train, y_val, y_test, classes, id2emotion):
             if split == "test":
                 y_bin = label_binarize(y_true, classes=classes)
                 try:
-                    metrics["roc_auc"] = round(float(roc_auc_score(y_bin, prob, multi_class="ovr", average="weighted")), 4)
+                    metrics["roc_auc"] = round(float(roc_auc_score(
+                        y_bin, prob, multi_class="ovr", average="weighted")), 4)
                 except:
                     metrics["roc_auc"] = None
                 results["per_emotion"] = per_emotion_metrics(y_true, y_pred, id2emotion, classes)

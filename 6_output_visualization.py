@@ -385,7 +385,7 @@ def plot_11_tsne(y_test, id2emotion):
     print("  [INFO] Running t-SNE (may take ~1 min)...")
     svd = TruncatedSVD(n_components=50, random_state=42)
     X50 = svd.fit_transform(X_sub)
-    tsne = TSNE(n_components=2, perplexity=40, random_state=42, n_iter=800)
+    tsne = TSNE(n_components=2, perplexity=40, random_state=42, max_iter=800)
     X2d  = tsne.fit_transform(X50)
 
     emotions_present = sorted(set(y_sub))

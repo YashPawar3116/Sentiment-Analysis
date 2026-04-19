@@ -134,8 +134,10 @@ def run_classical_models(data):
         # (name, model, tr_key, val_key, needs_scaler)
         ("Logistic Regression (TF-IDF)",
             LogisticRegression(
-                C=1.0, solver="saga", max_iter=300,   # was 500
-                multi_class="multinomial", n_jobs=N_JOBS,
+                C=1.0, solver="lbfgs", max_iter=1000,
+                # lbfgs handles sparse TF-IDF far better than saga+multinomial
+                # which was diverging (val F1 0.27 vs expected ~0.40+)
+                multi_class="ovr", n_jobs=N_JOBS,
                 class_weight="balanced", random_state=RANDOM_STATE),
             "tfidf_train", "tfidf_val", False),
 
@@ -459,6 +461,10 @@ def train_distilbert(y_train, y_val):
         elapsed = time.time() - start
         print(f"\n  DistilBERT — Best Val Acc: {best_acc:.4f}  Best Val F1: {best_val_f1:.4f}"
               f"  Time: {elapsed:.0f}s")
+
+        # Write sentinel so Part 5 knows fine-tuning actually completed
+        # (the model folder exists even when skipped due to tokenizer download)
+        (TRAINED_DIR / "distilbert_trained.flag").write_text("ok")
 
         return {
             "name": "DistilBERT (fine-tuned)",
