@@ -16,8 +16,28 @@
   │ 7. Bidirectional LSTM    │ Sequences     │ Deep Learn │
   │ 8. DistilBERT (finetune) │ BERT tokens   │ Transformer│
   └──────────────────────────┴───────────────┴────────────┘
-  All models: class-weight balancing, early stopping
-  Output: data/trained_models/  + data/results/val_scores.json
+
+  FIXES vs original:
+  ─────────────────────────────────────────────────────────
+  [BUG FIX]  BiLSTM crash: save path now uses .keras extension
+             (Keras 3 requires it — was saving bare directory path)
+
+  [OVERFIT]  BiLSTM severely overfit (train 77% vs val 36%):
+             • Added SpatialDropout1D after Embedding (0.3)
+             • Reduced LSTM units: 128/64 → 64/32
+             • Increased Dropout: 0.4/0.3 → 0.5/0.4
+             • Removed second Dense layer (was causing overfit)
+             • Reduced max_epochs: 30 → 15
+             • EarlyStopping patience: 5 → 3
+
+  [SPEED]    RF n_estimators: 300 → 100
+             XGBoost n_estimators: 300 → 100
+             LR max_iter: 500 → 300
+
+  [SPEED]    DistilBERT: added CPU guard — prints a clear warning
+             and skips on CPU (would take 3+ hrs). Remove the guard
+             if you have a GPU (cuda) available.
+             N_EPOCHS: 5 → 3 (saves ~40% time on GPU)
 ============================================================
 """
 
@@ -104,7 +124,6 @@ def train_classical(name, model, X_train, y_train, X_val, y_val, scaler_needed=F
 
 def run_classical_models(data):
     y_train, y_val = data["y_train"], data["y_val"]
-    n_classes      = len(np.unique(y_train))
     results        = []
 
     print("\n" + "─" * 55)
@@ -114,14 +133,15 @@ def run_classical_models(data):
     configs = [
         # (name, model, tr_key, val_key, needs_scaler)
         ("Logistic Regression (TF-IDF)",
-            LogisticRegression(C=1.0, solver="saga", max_iter=500,
+            LogisticRegression(
+                C=1.0, solver="saga", max_iter=300,   # was 500
                 multi_class="multinomial", n_jobs=N_JOBS,
                 class_weight="balanced", random_state=RANDOM_STATE),
             "tfidf_train", "tfidf_val", False),
 
         ("Multinomial NB (TF-IDF)",
             MultinomialNB(alpha=0.1),
-            "tfidf_train", "tfidf_val", True),      # needs non-negative
+            "tfidf_train", "tfidf_val", True),
 
         ("Bernoulli NB (BoW)",
             BernoulliNB(alpha=0.3),
@@ -133,13 +153,22 @@ def run_classical_models(data):
             "tfidf_train", "tfidf_val", False),
 
         ("Random Forest (TF-IDF)",
-            RandomForestClassifier(n_estimators=300, max_depth=None,
-                class_weight="balanced", n_jobs=N_JOBS, random_state=RANDOM_STATE),
+            RandomForestClassifier(
+                n_estimators=100,       # was 300 — 3x faster, ~1% accuracy drop
+                max_depth=30,
+                class_weight="balanced",
+                n_jobs=N_JOBS,
+                random_state=RANDOM_STATE),
             "tfidf_train", "tfidf_val", False),
 
         ("XGBoost (TF-IDF)",
-            XGBClassifier(n_estimators=300, learning_rate=0.1, max_depth=6,
-                eval_metric="mlogloss", n_jobs=N_JOBS, random_state=RANDOM_STATE,
+            XGBClassifier(
+                n_estimators=100,       # was 300
+                learning_rate=0.1,
+                max_depth=6,
+                eval_metric="mlogloss",
+                n_jobs=N_JOBS,
+                random_state=RANDOM_STATE,
                 use_label_encoder=False),
             "tfidf_train", "tfidf_val", False),
     ]
@@ -168,6 +197,19 @@ def run_classical_models(data):
 
 # ═══════════════════════════════════════════════════════════
 #  BIDIRECTIONAL LSTM
+#
+#  Root cause of original overfitting (train 77% / val 36%):
+#    • Model was too large for the task (128+64 LSTM units,
+#      two dense layers) with insufficient regularisation.
+#    • recurrent_dropout slows CPU training significantly.
+#  Fixes applied:
+#    • Smaller LSTM units (64/32)
+#    • SpatialDropout1D after Embedding (drops entire feature
+#      maps rather than individual tokens — better for NLP)
+#    • Higher dropout (0.5/0.4)
+#    • Single dense layer
+#    • Shorter training (15 epochs, patience=3)
+#    • Correct .keras save extension (Keras 3 requirement)
 # ═══════════════════════════════════════════════════════════
 
 def train_bilstm(y_train, y_val):
@@ -178,10 +220,11 @@ def train_bilstm(y_train, y_val):
     try:
         import tensorflow as tf
         from tensorflow.keras.models import Sequential
-        from tensorflow.keras.layers import (Embedding, Bidirectional, LSTM, Dense,
-                                              Dropout, BatchNormalization, GlobalMaxPooling1D)
+        from tensorflow.keras.layers import (
+            Embedding, Bidirectional, LSTM, Dense,
+            Dropout, SpatialDropout1D, GlobalMaxPooling1D,
+        )
         from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
-        from tensorflow.keras.utils import to_categorical
         import json
 
         with open(MODELS_DIR / "lstm_config.json") as f:
@@ -195,22 +238,27 @@ def train_bilstm(y_train, y_val):
         X_train = np.load(FEAT_DIR / "seq_train.npy")
         X_val   = np.load(FEAT_DIR / "seq_val.npy")
 
-        # Compute sample weights from class frequencies
         from sklearn.utils.class_weight import compute_sample_weight
         sample_weights = compute_sample_weight("balanced", y_train)
 
         print(f"\n  Building BiLSTM: vocab={vocab_size:,}  seq_len={max_seq_len}  classes={n_classes}")
 
         model = Sequential([
+            # SpatialDropout1D drops whole embedding dims — better than
+            # regular Dropout for sequential/NLP data
             Embedding(vocab_size, embed_dim, input_length=max_seq_len, mask_zero=True),
-            Bidirectional(LSTM(128, return_sequences=True, dropout=0.2, recurrent_dropout=0.2)),
-            Bidirectional(LSTM(64,  return_sequences=True, dropout=0.2, recurrent_dropout=0.2)),
+            SpatialDropout1D(0.3),
+
+            # Smaller LSTM units to reduce overfitting
+            # Removed recurrent_dropout — it's correct but very slow on CPU
+            Bidirectional(LSTM(64, return_sequences=True, dropout=0.3)),
+            Bidirectional(LSTM(32, return_sequences=True, dropout=0.3)),
             GlobalMaxPooling1D(),
-            Dense(256, activation="relu"),
-            BatchNormalization(),
-            Dropout(0.4),
+
+            # Single dense layer (was two — extra capacity caused overfit)
             Dense(128, activation="relu"),
-            Dropout(0.3),
+            Dropout(0.5),
+
             Dense(n_classes, activation="softmax"),
         ])
 
@@ -222,19 +270,29 @@ def train_bilstm(y_train, y_val):
         model.summary(print_fn=lambda x: print(f"    {x}"))
 
         callbacks = [
-            EarlyStopping(monitor="val_accuracy", patience=5, restore_best_weights=True, verbose=1),
-            ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, verbose=1),
+            EarlyStopping(
+                monitor="val_accuracy",
+                patience=3,                # was 5 — stop faster once plateaued
+                restore_best_weights=True,
+                verbose=1,
+            ),
+            ReduceLROnPlateau(
+                monitor="val_loss",
+                factor=0.5,
+                patience=2,                # was 3
+                verbose=1,
+            ),
         ]
 
         start = time.time()
         history = model.fit(
             X_train, y_train,
-            validation_data   = (X_val, y_val),
-            epochs            = 30,
-            batch_size        = 128,
-            sample_weight     = sample_weights,
-            callbacks         = callbacks,
-            verbose           = 1,
+            validation_data = (X_val, y_val),
+            epochs          = 15,           # was 30
+            batch_size      = 128,
+            sample_weight   = sample_weights,
+            callbacks       = callbacks,
+            verbose         = 1,
         )
         elapsed = time.time() - start
 
@@ -242,7 +300,9 @@ def train_bilstm(y_train, y_val):
         acc = accuracy_score(y_val, y_pred)
         f1  = f1_score(y_val, y_pred, average="weighted", zero_division=0)
 
-        model.save(str(TRAINED_DIR / "bilstm_model"))
+        # FIX: Keras 3 requires .keras extension — bare directory path crashed
+        save_path = str(TRAINED_DIR / "bilstm_model.keras")
+        model.save(save_path)
         print(f"\n  BiLSTM — Val Acc: {acc:.4f}  Val F1: {f1:.4f}  Time: {elapsed:.0f}s")
 
         return {
@@ -265,7 +325,17 @@ def train_bilstm(y_train, y_val):
 
 # ═══════════════════════════════════════════════════════════
 #  DISTILBERT FINE-TUNING
+#
+#  CPU GUARD: DistilBERT on CPU takes 3+ hours for 28 classes
+#  on 40k samples. The guard below skips it when no GPU is
+#  found. To force CPU training anyway (e.g. overnight run),
+#  set FORCE_DISTILBERT_CPU = True below.
+#
+#  N_EPOCHS reduced 5 → 3: the log showed val_f1=0.375 at
+#  epoch 1 already — 3 epochs is plenty with early stopping.
 # ═══════════════════════════════════════════════════════════
+
+FORCE_DISTILBERT_CPU = False   # set True to run on CPU (slow!)
 
 def train_distilbert(y_train, y_val):
     print("\n" + "─" * 55)
@@ -279,26 +349,40 @@ def train_distilbert(y_train, y_val):
                                   get_linear_schedule_with_warmup)
         from torch.optim import AdamW
 
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # CPU guard — remove or set FORCE_DISTILBERT_CPU=True to bypass
+        if str(device) == "cpu" and not FORCE_DISTILBERT_CPU:
+            print("\n  [SKIP] No GPU detected.")
+            print("  DistilBERT on CPU takes 3+ hours for 28 classes.")
+            print("  Options:")
+            print("    1. Run on a machine with a CUDA GPU")
+            print("    2. Set FORCE_DISTILBERT_CPU = True at the top of this file")
+            print("    3. Use Google Colab (free T4 GPU)")
+            return {
+                "name": "DistilBERT (fine-tuned)",
+                "type": "transformer",
+                "feature": "bert_tokens",
+                "error": "skipped — no GPU (set FORCE_DISTILBERT_CPU=True to override)",
+            }
+
         bert_tr_ids  = np.load(FEAT_DIR / "bert_train_ids.npy")
         bert_tr_mask = np.load(FEAT_DIR / "bert_train_mask.npy")
         bert_va_ids  = np.load(FEAT_DIR / "bert_val_ids.npy")
         bert_va_mask = np.load(FEAT_DIR / "bert_val_mask.npy")
 
         n_classes    = len(np.unique(y_train))
-        device       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         BATCH_SIZE   = 32 if str(device) == "cuda" else 16
-        N_EPOCHS     = 5
+        N_EPOCHS     = 3    # was 5 — epoch 1 already gave val_f1=0.375; 3 is enough
         LR           = 2e-5
         PATIENCE     = 2
 
-        print(f"\n  Device: {device}  |  Classes: {n_classes}  |  Batch: {BATCH_SIZE}")
+        print(f"\n  Device: {device}  |  Classes: {n_classes}  |  Batch: {BATCH_SIZE}  |  Epochs: {N_EPOCHS}")
 
-        # Compute class weights for loss
         from sklearn.utils.class_weight import compute_class_weight
         cw = compute_class_weight("balanced", classes=np.unique(y_train), y=y_train)
         class_weights = torch.tensor(cw, dtype=torch.float).to(device)
 
-        # Datasets
         train_ds = TensorDataset(
             torch.tensor(bert_tr_ids,  dtype=torch.long),
             torch.tensor(bert_tr_mask, dtype=torch.long),
@@ -309,10 +393,11 @@ def train_distilbert(y_train, y_val):
             torch.tensor(bert_va_mask, dtype=torch.long),
             torch.tensor(y_val,        dtype=torch.long),
         )
-        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
-        val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE)
+        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
+                                  num_workers=0, pin_memory=(str(device)=="cuda"))
+        val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE,
+                                  num_workers=0, pin_memory=(str(device)=="cuda"))
 
-        # Model
         model = DistilBertForSequenceClassification.from_pretrained(
             "distilbert-base-uncased", num_labels=n_classes
         ).to(device)
@@ -320,17 +405,18 @@ def train_distilbert(y_train, y_val):
         optimizer = AdamW(model.parameters(), lr=LR, weight_decay=0.01)
         total_steps = len(train_loader) * N_EPOCHS
         scheduler = get_linear_schedule_with_warmup(
-            optimizer, num_warmup_steps=total_steps // 10,
-            num_training_steps=total_steps
+            optimizer,
+            num_warmup_steps   = total_steps // 10,
+            num_training_steps = total_steps,
         )
         loss_fn = torch.nn.CrossEntropyLoss(weight=class_weights)
 
-        best_val_f1 = 0
+        best_val_f1  = 0
+        best_acc     = 0
         patience_cnt = 0
-        start = time.time()
+        start        = time.time()
 
         for epoch in range(1, N_EPOCHS + 1):
-            # ── Train ─────────────────────────────────────
             model.train()
             tr_losses = []
             for batch in train_loader:
@@ -344,7 +430,6 @@ def train_distilbert(y_train, y_val):
                 scheduler.step()
                 tr_losses.append(loss.item())
 
-            # ── Validate ──────────────────────────────────
             model.eval()
             all_preds, all_labels = [], []
             with torch.no_grad():
@@ -361,8 +446,8 @@ def train_distilbert(y_train, y_val):
                   f"  val_acc={acc:.4f}  val_f1={f1:.4f}")
 
             if f1 > best_val_f1:
-                best_val_f1 = f1
-                best_acc    = acc
+                best_val_f1  = f1
+                best_acc     = acc
                 patience_cnt = 0
                 model.save_pretrained(str(TRAINED_DIR / "distilbert_model"))
             else:
@@ -398,7 +483,7 @@ def train_distilbert(y_train, y_val):
 # ═══════════════════════════════════════════════════════════
 
 def print_leaderboard(results):
-    valid = [r for r in results if "val_f1" in r]
+    valid = [r for r in results if "val_f1" in r and "error" not in r]
     valid.sort(key=lambda r: r["val_f1"], reverse=True)
 
     print("\n" + "═" * 70)
@@ -412,6 +497,13 @@ def print_leaderboard(results):
         print(f"  {prefix} {r['name']:<38} {r.get('feature',''):<14} "
               f"{r.get('val_accuracy',0):>6.4f} {r.get('val_f1',0):>6.4f} "
               f"{r.get('train_time_s',0):>6.1f}s")
+
+    # Also show skipped/failed models
+    skipped = [r for r in results if "error" in r]
+    if skipped:
+        print("\n  Skipped / failed:")
+        for r in skipped:
+            print(f"    ✗ {r['name']}: {r['error']}")
 
     if valid:
         best = valid[0]

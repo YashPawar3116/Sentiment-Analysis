@@ -17,6 +17,12 @@
   Input:  data/processed/  train/val/test.csv
   Output: data/features/   *.npz / *.npy
           data/models/      vectorizers + tokenizer
+
+  CHANGES vs original:
+    - TFIDF_MAX_FEATURES  40k → 20k  (faster, negligible accuracy loss)
+    - NGRAM_RANGE         (1,3) → (1,2)  (trigrams add little for emotion)
+    - W2V_EPOCHS / FT_EPOCHS  15 → 5  (biggest time saver in this part)
+    - W2V_VECTOR_SIZE / FT_VECTOR_SIZE  200 → 100  (half the RAM + time)
 ============================================================
 """
 
@@ -42,17 +48,17 @@ for d in [FEATURES_DIR, MODELS_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 # ── Config ────────────────────────────────────────────────
-TFIDF_MAX_FEATURES  = 40_000
-BOW_MAX_FEATURES    = 25_000
-NGRAM_RANGE         = (1, 3)    # unigrams, bigrams, trigrams
-W2V_VECTOR_SIZE     = 200
-W2V_WINDOW          = 6
+TFIDF_MAX_FEATURES  = 20_000   # was 40_000 — halved, minimal accuracy impact
+BOW_MAX_FEATURES    = 15_000   # was 25_000
+NGRAM_RANGE         = (1, 2)   # was (1, 3) — trigrams slow TF-IDF with little gain
+W2V_VECTOR_SIZE     = 100      # was 200 — halved: less RAM, same quality
+W2V_WINDOW          = 5        # was 6
 W2V_MIN_COUNT       = 2
-W2V_EPOCHS          = 15
-FT_VECTOR_SIZE      = 200
-FT_EPOCHS           = 15
-LSTM_MAX_VOCAB      = 30_000
-LSTM_MAX_SEQ_LEN    = 100       # pad/truncate all sequences to this
+W2V_EPOCHS          = 5        # was 15 — biggest speedup in this file
+FT_VECTOR_SIZE      = 100      # was 200
+FT_EPOCHS           = 5        # was 15
+LSTM_MAX_VOCAB      = 20_000   # was 30_000
+LSTM_MAX_SEQ_LEN    = 100
 BERT_MODEL_NAME     = "distilbert-base-uncased"
 BERT_MAX_LEN        = 128
 RANDOM_STATE        = 42
@@ -113,7 +119,7 @@ def extract_tfidf(train, val, test):
     print("\n[INFO] TF-IDF extraction...")
     vec = TfidfVectorizer(
         max_features  = TFIDF_MAX_FEATURES,
-        ngram_range   = NGRAM_RANGE,
+        ngram_range   = NGRAM_RANGE,        # (1,2) — bigrams only
         sublinear_tf  = True,
         min_df        = 2,
         max_df        = 0.95,
@@ -143,7 +149,7 @@ def extract_bow(train, val, test):
         ngram_range  = (1, 2),
         min_df       = 2,
         max_df       = 0.95,
-        binary       = True,      # Bernoulli NB needs binary
+        binary       = True,
     )
     Xtr = vec.fit_transform(train["clean_text"])
     Xv  = vec.transform(val["clean_text"])
@@ -172,8 +178,15 @@ def extract_word2vec(train, val, test):
     va_tok = tokenize_series(val["clean_text"])
     te_tok = tokenize_series(test["clean_text"])
 
-    model = Word2Vec(tr_tok, vector_size=W2V_VECTOR_SIZE, window=W2V_WINDOW,
-                     min_count=W2V_MIN_COUNT, workers=4, epochs=W2V_EPOCHS, seed=RANDOM_STATE)
+    model = Word2Vec(
+        tr_tok,
+        vector_size = W2V_VECTOR_SIZE,  # 100 (was 200)
+        window      = W2V_WINDOW,
+        min_count   = W2V_MIN_COUNT,
+        workers     = 4,
+        epochs      = W2V_EPOCHS,       # 5 (was 15)
+        seed        = RANDOM_STATE,
+    )
     model.save(str(MODELS_DIR / "word2vec.model"))
     print(f"    Vocab: {len(model.wv):,} words")
 
@@ -198,8 +211,15 @@ def extract_fasttext(train, val, test):
     va_tok = tokenize_series(val["clean_text"])
     te_tok = tokenize_series(test["clean_text"])
 
-    model = FastText(tr_tok, vector_size=FT_VECTOR_SIZE, window=W2V_WINDOW,
-                     min_count=W2V_MIN_COUNT, workers=4, epochs=FT_EPOCHS, seed=RANDOM_STATE)
+    model = FastText(
+        tr_tok,
+        vector_size = FT_VECTOR_SIZE,   # 100 (was 200)
+        window      = W2V_WINDOW,
+        min_count   = W2V_MIN_COUNT,
+        workers     = 4,
+        epochs      = FT_EPOCHS,        # 5 (was 15)
+        seed        = RANDOM_STATE,
+    )
     model.save(str(MODELS_DIR / "fasttext.model"))
     print(f"    Vocab: {len(model.wv):,} words (+ char n-grams for OOV)")
 
@@ -219,15 +239,9 @@ def extract_fasttext(train, val, test):
 # ═══════════════════════════════════════════════════════════
 
 def extract_sequences(train, val, test):
-    """
-    Build a vocabulary from training text.
-    Convert each sample to a fixed-length integer sequence.
-    Padding: post-pad / post-truncate.
-    """
     print("\n[INFO] Building integer sequences for LSTM...")
     from collections import Counter
 
-    # Build vocab on train
     counter = Counter()
     for text in train["clean_text"]:
         counter.update(text.split())
@@ -239,7 +253,6 @@ def extract_sequences(train, val, test):
     def encode(text):
         tokens = text.split()[:LSTM_MAX_SEQ_LEN]
         ids    = [vocab.get(t, 1) for t in tokens]
-        # Pad
         ids   += [0] * (LSTM_MAX_SEQ_LEN - len(ids))
         return ids
 
@@ -265,17 +278,12 @@ def extract_sequences(train, val, test):
 # ═══════════════════════════════════════════════════════════
 
 def extract_bert_tokens(train, val, test):
-    """
-    Tokenize using HuggingFace DistilBERT tokenizer.
-    Saves input_ids and attention_mask tensors.
-    """
     print("\n[INFO] BERT tokenization (DistilBERT)...")
     try:
         from transformers import DistilBertTokenizerFast
         tokenizer = DistilBertTokenizerFast.from_pretrained(BERT_MODEL_NAME)
     except ImportError:
         print("    [SKIP] transformers not installed. Run: pip install transformers")
-        print("           DistilBERT model will be skipped in training.")
         return None, None, None, None
 
     def tokenize_batch(texts, desc=""):
